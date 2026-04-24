@@ -1,0 +1,5 @@
+/.DS_Store
+/.venv
+/__pycache__
+/game_data_public.ECL.PremierDraft.csv
+/game_data_public.MID.PremierDraft.csv
