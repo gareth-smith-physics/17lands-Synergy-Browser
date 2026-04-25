@@ -8,7 +8,9 @@ import gzip
 import time
 import scrython
 import os
+import pyarrow as pa
 import pyarrow.parquet as pq
+import io
 
 
 st.set_page_config(
@@ -106,7 +108,6 @@ min_sample_size = st.sidebar.slider(
 )
 
 # Function to get parquet row count for slider max value
-@st.cache_data(show_spinner=False)
 def get_parquet_row_count(selected_set):
     """Get the total number of rows in the parquet file"""
     
@@ -240,7 +241,7 @@ def create_plotly_plot(plotdf, synergy_card, synergy_number):
     
     return fig
 
-def download_and_convert_to_parquet(url, csv_filename, parquet_filename):
+def download_and_convert_to_parquet(url, parquet_filename):
     """Downloads CSV and converts to Parquet immediately to save space and time."""
     with st.spinner("Downloading data from 17lands..."):
         response = requests.get(url, stream=True, timeout=60)
@@ -248,25 +249,40 @@ def download_and_convert_to_parquet(url, csv_filename, parquet_filename):
         
         # 1. Stream decompress to a temporary CSV
         with gzip.GzipFile(fileobj=response.raw) as gz:
-            with open(csv_filename, 'wb') as f:
-                for chunk in iter(lambda: gz.read(1024 * 1024), b''):
-                    f.write(chunk)
-
-        # 1.5. Filter columns to keep only needed ones
-        needed_prefixes = ('deck_', 'opening_hand_', 'drawn_', 'won')
-        full_header = pd.read_csv(csv_filename, nrows=0).columns
-        cols_to_keep = [c for c in full_header if c.startswith(needed_prefixes)]
         
-        # 2. Convert CSV to Parquet in chunks to keep RAM low during conversion
-        with pd.read_csv(csv_filename, chunksize=10000, usecols=cols_to_keep) as reader:
-            for i, chunk in enumerate(reader):
-                # On the first chunk, create the file; after that, append
-                append = i > 0
-                chunk.to_parquet(parquet_filename, engine='fastparquet', append=append)
+            text_stream = io.TextIOWrapper(gz, encoding='utf-8')
 
-        # 3. Clean up the heavy CSV
-        if os.path.exists(csv_filename):
-            os.remove(csv_filename)
+            # 1.5. Filter columns to keep only needed ones
+            needed_columns = ['won']
+            data_types = [np.bool_]
+            for card in all_cards:
+                needed_columns.extend([f'deck_{card}', f'opening_hand_{card}', f'drawn_{card}'])
+                data_types.extend([np.int8, np.int8, np.int8])
+                    
+            reader = pd.read_csv(
+                text_stream, 
+                header='infer',
+                usecols=needed_columns, 
+                chunksize=50000, 
+                engine='c'
+            )
+
+            writer = None
+            for chunk in reader:
+                chunk = chunk.dropna()
+                chunk = chunk.astype('int8')
+                # Convert to Arrow Table (efficient for Parquet)
+                table = pa.Table.from_pandas(chunk)
+                
+                if writer is None:
+                    # Snappy compression is much faster than Gzip for Parquet
+                    writer = pq.ParquetWriter(parquet_filename, table.schema, compression='snappy')
+                
+                writer.write_table(table)
+            
+            if writer:
+                writer.close()
+            
 
 @st.cache_data(show_spinner=False)
 def analyze_large_parquet(selected_set, max_games, synergy_card, synergy_number):
@@ -275,11 +291,9 @@ def analyze_large_parquet(selected_set, max_games, synergy_card, synergy_number)
     if not os.path.exists(parquet_filename):
         csv_filename = f"game_data_public.{selected_set}.PremierDraft.csv"
         url = f"https://17lands-public.s3.amazonaws.com/analysis_data/game_data/{csv_filename}.gz"
-        download_and_convert_to_parquet(url, csv_filename, parquet_filename)
+        download_and_convert_to_parquet(url, parquet_filename)
     
     parquet_file = pq.ParquetFile(parquet_filename)
-    needed_prefixes = ('deck_', 'opening_hand_', 'drawn_', 'won')
-    cols_to_use = [c for c in parquet_file.schema.names if c.startswith(needed_prefixes)]
     cards = [c for c in non_rare_cards if c != synergy_card]
     
     # Initialize running totals
@@ -295,7 +309,7 @@ def analyze_large_parquet(selected_set, max_games, synergy_card, synergy_number)
             break
 
         # Load only specific columns for this row group
-        chunk = parquet_file.read_row_group(i, columns=cols_to_use).to_pandas()
+        chunk = parquet_file.read_row_group(i).to_pandas()
         
         # If chunk is larger than remaining limit, trim it
         if rows_processed + len(chunk) > max_games:
