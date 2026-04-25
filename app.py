@@ -15,7 +15,7 @@ import io
 
 st.set_page_config(
     page_title="Magic: The Gathering Draft Synergy Analyzer",
-    page_icon="🔍",
+    page_icon="fav.png",
     layout="wide"
 )
 
