@@ -260,7 +260,7 @@ def download_and_save_raw(url, csv_filename):
                     f.write(chunk)
 
 @st.cache_data(show_spinner=False)
-def analyze_large_csv(selected_set, max_games, synergy_card, synergy_number, min_sample_size):
+def analyze_large_csv(selected_set, max_games, synergy_card, synergy_number):
     csv_filename = f"game_data_public.{selected_set}.PremierDraft.csv"
 
     if not os.path.exists(csv_filename):
@@ -314,13 +314,7 @@ def analyze_large_csv(selected_set, max_games, synergy_card, synergy_number, min
         'n_GIH_syn': total_syn_count
     }, index=cards)
 
-    # 5. Calculate average improvement, weighted by sample size
-    avg_improvement = (plotdf['Improvement'] * plotdf['n_GIH_syn']).sum() / plotdf['n_GIH_syn'].sum()
-    
-    # 6. Filter by sample size at the end (much faster)
-    plotdf = plotdf[plotdf['n_GIH_syn'] > min_sample_size].dropna()
-
-    return plotdf, avg_improvement
+    return plotdf
 
 # Main content
 # Only proceed if a set code is provided
@@ -328,9 +322,15 @@ if selected_set and len(selected_set) == 3 and valid_set_code:
     try:            
         # Analyze synergies
         with st.spinner("Analyzing synergies..."):
-            plotdf, avg_improvement = analyze_large_csv(selected_set, max_games, synergy_card, synergy_number, min_sample_size)
+            plotdf = analyze_large_csv(selected_set, max_games, synergy_card, synergy_number)
         
         if len(plotdf) > 0:
+
+            # Calculate average improvement, weighted by sample size
+            avg_improvement = (plotdf['Improvement'] * plotdf['n_GIH_syn']).sum() / plotdf['n_GIH_syn'].sum()
+            
+            # Filter by sample size at the end (much faster)
+            plotdf = plotdf[plotdf['n_GIH_syn'] > min_sample_size].dropna()
             
             # Create tabs for different views
             tab1, tab2 = st.tabs(["Interactive Plot", "Data Table"])
