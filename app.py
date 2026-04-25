@@ -8,6 +8,7 @@ import gzip
 import io
 import time
 import scrython
+import os
 
 
 st.set_page_config(
@@ -43,7 +44,7 @@ selected_set = st.sidebar.text_input(
     value="",
     max_chars=3,
     help="Enter a 3-letter set code (KHM onwards)"
-)
+).upper()
 
 @st.cache_data(show_spinner=False)
 def get_cards_by_rarity(set_code):
@@ -53,7 +54,14 @@ def get_cards_by_rarity(set_code):
         for r in rarities:
             search = scrython.cards.Search(q=f's:{set_code} r:{r} -is:digital')
             names = [card.name.split(' // ')[0] for card in search.data]
-            results[r] = names
+            # Remove non-English characters and normalize
+            cleaned_names = []
+            for name in names:
+                # Keep only ASCII characters (English letters, numbers, basic punctuation)
+                ascii_name = ''.join([c if ord(c) < 128 else '?' for c in name])
+                if ascii_name:
+                    cleaned_names.append(ascii_name)
+            results[r] = cleaned_names
             time.sleep(0.1) 
     except scrython.base.ScryfallError as e:
         st.error(f"Error fetching cards for set \"{set_code}\": {str(e)}")
@@ -91,7 +99,7 @@ synergy_number = st.sidebar.slider(
 min_sample_size = st.sidebar.slider(
     "Minimum Sample Size",
     min_value=50,
-    max_value=500,
+    max_value=2000,
     value=100,
     step=10,
     help="Minimum games needed for a card be shown in the results"
@@ -101,7 +109,6 @@ min_sample_size = st.sidebar.slider(
 @st.cache_data(show_spinner=False)
 def get_csv_row_count(selected_set):
     """Get the total number of rows in the CSV file"""
-    import os
     
     csv_filename = f"game_data_public.{selected_set}.PremierDraft.csv"
     
@@ -114,21 +121,7 @@ def get_csv_row_count(selected_set):
             return row_count
         except:
             pass
-    
-    # If local file doesn't exist or is corrupted, download just the header
-    url = f"https://17lands-public.s3.amazonaws.com/analysis_data/game_data/game_data_public.{selected_set}.PremierDraft.csv.gz"
-    try:
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-        
-        # Read just the first chunk to estimate size
-        with gzip.GzipFile(fileobj=io.BytesIO(response.content)) as gz_file:
-            # Read first 1000 rows to estimate, then use reasonable default
-            sample_df = pd.read_csv(gz_file, nrows=1000)
-            # Estimate based on typical dataset sizes (use conservative estimate)
-            return min(1000000, max(10000, len(sample_df) * 100))  # Conservative estimate
-    except:
-        return 1000000  # Fallback to large default
+    return 1000000  # Fallback to large default
 
 # Get row count if set is provided
 if selected_set and len(selected_set) == 3:
@@ -152,60 +145,30 @@ def get_card_image_url(card_name):
     card_name_safe = card_name.replace("'", "").replace(" ", "+").replace("-", "+").replace(",", "")
     return f"https://api.scryfall.com/cards/named?exact={card_name_safe}&format=image&version=normal"
 
-
-@st.cache_data(show_spinner=False)
-def analyze_synergies_vectorized(df, synergy_card, synergy_number, min_sample_size):
-    # 1. Pre-filter the dataframe once for the synergy condition
-    # This is the "With Synergy Card" subset
+def get_chunk_counts(chunk, cards, synergy_card, synergy_number):
+    """Calculates raw counts (won/played) for a single chunk."""
+    # Subset for Synergy
     deck_col = f"deck_{synergy_card}"
-    has_synergy = df[deck_col] >= synergy_number
-    df_syn = df[has_synergy]
-
-    cards = [card for card in non_rare_cards if card != synergy_card]
+    has_synergy = chunk[deck_col] >= synergy_number
+    chunk_syn = chunk[has_synergy]
     
-    # 2. Identify all GIH columns (Opening Hand + Drawn)
-    # We create a boolean matrix where True = Card was seen in game
-    # This assumes your columns follow the 'opening_hand_Name' naming convention
     oh_cols = [f"opening_hand_{name}" for name in cards]
     dr_cols = [f"drawn_{name}" for name in cards]
     
-    # Create binary "In Hand" matrices (1 if card seen, 0 otherwise)
-    # We do this for the full DF and the Synergy-filtered DF
-    gih_matrix = (df[oh_cols].values + df[dr_cols].values > 0)
-    gih_matrix_syn = (df_syn[oh_cols].values + df_syn[dr_cols].values > 0)
-    
-    # 3. Calculate Win Rates using matrix math
-    # Win rate = (Sum of 'won' where GIH) / (Total where GIH)
-    won_full = df['won'].astype(np.float64).values
-    won_syn = df_syn['won'].astype(np.float64).values
-    
-    # Summing across rows to get counts per card
-    count_gih = gih_matrix.sum(axis=0)
-    count_won_gih = (gih_matrix.T @ won_full) # Dot product is faster than sum(axis=0)
-    
-    count_gih_syn = gih_matrix_syn.sum(axis=0)
-    count_won_gih_syn = (gih_matrix_syn.T @ won_syn)
+    # helper to get counts from a dataframe
+    def get_stats(df_subset):
+        if df_subset.empty:
+            return np.zeros(len(cards)), np.zeros(len(cards))
+        # GIH Matrix: 1 if card was in opening hand OR drawn
+        gih_matrix = (df_subset[oh_cols].values + df_subset[dr_cols].values > 0)
+        counts = gih_matrix.sum(axis=0)
+        wins = gih_matrix.T @ df_subset['won'].astype(np.float64).values
+        return counts, wins
 
-    gih_wr = np.divide(count_won_gih, count_gih, out=np.zeros_like(count_won_gih), where=count_gih!=0)
-    gih_wr_syn = np.divide(count_won_gih_syn, count_gih_syn, out=np.zeros_like(count_won_gih_syn), where=count_gih_syn!=0)
-    improvement = (gih_wr_syn - gih_wr).round(3)
+    gih_c, gih_w = get_stats(chunk)
+    syn_c, syn_w = get_stats(chunk_syn)
     
-    # 4. Construct the results DataFrame with zero-safe division
-    # Avoid division by zero by using np.divide with where parameter
-    plotdf = pd.DataFrame({
-        'GIH_wr': gih_wr,
-        'GIH_wr_syn': gih_wr_syn,
-        'Improvement': improvement,
-        'n_GIH_syn': count_gih_syn
-    }, index=cards)
-
-    # 5. Calculate average improvement, weighted by sample size
-    avg_improvement = (plotdf['Improvement'] * plotdf['n_GIH_syn']).sum() / plotdf['n_GIH_syn'].sum()
-    
-    # 6. Filter by sample size at the end (much faster)
-    plotdf = plotdf[plotdf['n_GIH_syn'] > min_sample_size].dropna()
-    
-    return plotdf, avg_improvement
+    return gih_c, gih_w, syn_c, syn_w
 
 def create_plotly_plot(plotdf, synergy_card, synergy_number):
     """Create interactive Plotly scatter plot"""
@@ -277,132 +240,159 @@ def create_plotly_plot(plotdf, synergy_card, synergy_number):
     
     return fig
 
-# Load data once at startup
-@st.cache_resource(show_spinner=False)
-def load_data(max_games, selected_set):
-    """Download, decompress and cache the CSV data from 17lands S3"""
-    import os
-    
-    # Local file paths
-    csv_filename = f"game_data_public.{selected_set}.PremierDraft.csv"
-    
-    # Check if CSV already exists locally
-    if os.path.exists(csv_filename):
+def get_needed_columns(csv_filename):
+    """Peek at the header to determine which columns to keep."""
+    needed_prefixes = ('deck_', 'opening_hand_', 'drawn_', 'won', 'rank', 'colors')
+    header = pd.read_csv(csv_filename, nrows=0)
+    return [c for c in header.columns if c.startswith(needed_prefixes)]
 
-        needed_prefixes = ('deck_', 'opening_hand_', 'drawn_', 'won', 'rank', 'colors')
-        header = pd.read_csv(csv_filename, nrows=0)
-        cols_to_use = [c for c in header.columns if c.startswith(needed_prefixes)]
+def download_and_save_raw(url, csv_filename):
+    """Streams the download and decompresses directly to disk."""
+    with st.spinner("Downloading and decompressing to disk..."):
+        response = requests.get(url, stream=True, timeout=60)
+        response.raise_for_status()
         
-        df = pd.read_csv(csv_filename, nrows=max_games, usecols=cols_to_use)
-        return df
+        # Decompress on the fly and write to local file
+        with gzip.GzipFile(fileobj=response.raw) as gz:
+            with open(csv_filename, 'wb') as f:
+                for chunk in iter(lambda: gz.read(1024 * 1024), b''): # 1MB chunks
+                    f.write(chunk)
+
+@st.cache_data(show_spinner=False)
+def analyze_large_csv(selected_set, max_games, synergy_card, synergy_number, min_sample_size):
+    csv_filename = f"game_data_public.{selected_set}.PremierDraft.csv"
+
+    if not os.path.exists(csv_filename):
+        url = f"https://17lands-public.s3.amazonaws.com/analysis_data/game_data/{csv_filename}.gz"
+        download_and_save_raw(url, csv_filename)
     
-    # Download and decompress if local file doesn't exist or is corrupted
-    url = f"https://17lands-public.s3.amazonaws.com/analysis_data/game_data/game_data_public.{selected_set}.PremierDraft.csv.gz"
+    cols_to_use = get_needed_columns(csv_filename)
+    cards = [c.replace('opening_hand_', '') for c in cols_to_use if c.startswith('opening_hand_')]
+    cards = [c for c in cards if c != synergy_card]
     
-    try:
-        # Download the gzipped file
-        with st.spinner(f"Downloading data for {selected_set}..."):
-            response = requests.get(url, stream=True)
-            response.raise_for_status()
+    # Initialize running totals
+    total_gih_count = np.zeros(len(cards))
+    total_gih_wins = np.zeros(len(cards))
+    total_syn_count = np.zeros(len(cards))
+    total_syn_wins = np.zeros(len(cards))
+
+    dtype_dict = {col: 'int8' for col in cols_to_use if 'won' in col or 'deck_' in col}
+    for col in cols_to_use:
+        if 'opening_hand' in col or 'drawn' in col:
+            dtype_dict[col] = 'int8'
+
+    rows_processed = 0
+    with pd.read_csv(csv_filename, usecols=cols_to_use, chunksize=10000, dtype=dtype_dict) as reader:
+        for chunk in reader:
+            # Respect max_games limit
+            if rows_processed >= max_games:
+                break
             
-            # Decompress and save to local CSV file
-            with gzip.GzipFile(fileobj=io.BytesIO(response.content)) as gz_file:
-                # Read full data first to save locally
-                full_df = pd.read_csv(gz_file)
-                # Save to local CSV for future use
-                full_df.to_csv(csv_filename, index=False)
-                # Return limited rows
-                return full_df.head(max_games)
-        
-    except requests.exceptions.RequestException as e:
-        st.error(f"Failed to download data for set {selected_set}: {str(e)}")
-        return None
-    except Exception as e:
-        st.error(f"Error processing data for set {selected_set}: {str(e)}")
-        return None
+            # If chunk is larger than remaining limit, trim it
+            if rows_processed + len(chunk) > max_games:
+                chunk = chunk.head(max_games - rows_processed)
+            
+            # Get counts for this chunk
+            gih_c, gih_w, syn_c, syn_w = get_chunk_counts(chunk, cards, synergy_card, synergy_number)
+            
+            # Accumulate
+            total_gih_count += gih_c
+            total_gih_wins += gih_w
+            total_syn_count += syn_c
+            total_syn_wins += syn_w
+            
+            rows_processed += len(chunk)
+
+    # Final Win Rate Calculations (Vectorized)
+    gih_wr = np.divide(total_gih_wins, total_gih_count, out=np.zeros_like(total_gih_wins), where=total_gih_count!=0)
+    gih_wr_syn = np.divide(total_syn_wins, total_syn_count, out=np.zeros_like(total_syn_wins), where=total_syn_count!=0)
+    
+    plotdf = pd.DataFrame({
+        'GIH_wr': gih_wr,
+        'GIH_wr_syn': gih_wr_syn,
+        'Improvement': (gih_wr_syn - gih_wr).round(3),
+        'n_GIH_syn': total_syn_count
+    }, index=cards)
+
+    # 5. Calculate average improvement, weighted by sample size
+    avg_improvement = (plotdf['Improvement'] * plotdf['n_GIH_syn']).sum() / plotdf['n_GIH_syn'].sum()
+    
+    # 6. Filter by sample size at the end (much faster)
+    plotdf = plotdf[plotdf['n_GIH_syn'] > min_sample_size].dropna()
+
+    return plotdf, avg_improvement
 
 # Main content
 # Only proceed if a set code is provided
 if selected_set and len(selected_set) == 3 and valid_set_code:
-    try:
-        # Load data from S3 (cached)
-        with st.spinner(f"Loading data for {selected_set}..."):
-            sdf = load_data(max_games, selected_set)
+    try:            
+        # Analyze synergies
+        with st.spinner("Analyzing synergies..."):
+            plotdf, avg_improvement = analyze_large_csv(selected_set, max_games, synergy_card, synergy_number, min_sample_size)
         
-        if sdf is not None:
+        if len(plotdf) > 0:
             
-            # Analyze synergies
-            with st.spinner("Analyzing synergies..."):
-                plotdf, avg_improvement = analyze_synergies_vectorized(sdf, synergy_card, synergy_number, min_sample_size)
+            # Create tabs for different views
+            tab1, tab2 = st.tabs(["Interactive Plot", "Data Table"])
             
-            if len(plotdf) > 0:
+            with tab1:
+                # Create columns for plot and card image
+                plot_col, image_col = st.columns([3, 1])
+                selected_card = None
                 
-                # Create tabs for different views
-                tab1, tab2 = st.tabs(["Interactive Plot", "Data Table"])
+                with plot_col:
+                    fig = create_plotly_plot(plotdf, synergy_card, synergy_number)
+                    event_data =st.plotly_chart(fig, width='stretch', on_select='rerun', key='scatter')
+
+                    selected_points = event_data["selection"]["point_indices"]
+                    if selected_points:
+                        point_idx = selected_points[0]
+                        actual_index = plotdf.index[point_idx]
+                        selected_card = actual_index
+                        card_data = plotdf.loc[selected_card]
+                        improvement = card_data['Improvement'] * 100
+                        description = "much better" if improvement > 6 \
+                            else "better" if improvement > 2 \
+                            else "slightly better" if improvement > 0 \
+                            else "slightly worse" if improvement > -2 \
+                            else "worse" if improvement > -6 \
+                            else "much worse"
+                        st.markdown(f"##### ***{selected_card}*** performs {description} in decks containing ***{synergy_number}*** ***{synergy_card}***.")
                 
-                with tab1:
-                    # Create columns for plot and card image
-                    plot_col, image_col = st.columns([3, 1])
-                    selected_card = None
+                with image_col:
                     
-                    with plot_col:
-                        fig = create_plotly_plot(plotdf, synergy_card, synergy_number)
-                        event_data =st.plotly_chart(fig, width='stretch', on_select='rerun', key='scatter')
-
-                        selected_points = event_data["selection"]["point_indices"]
-                        if selected_points:
-                            point_idx = selected_points[0]
-                            actual_index = plotdf.index[point_idx]
-                            selected_card = actual_index
-                            card_data = plotdf.loc[selected_card]
-                            improvement = card_data['Improvement'] * 100
-                            description = "much better" if improvement > 6 \
-                                else "better" if improvement > 2 \
-                                else "slightly better" if improvement > 0 \
-                                else "slightly worse" if improvement > -2 \
-                                else "worse" if improvement > -6 \
-                                else "much worse"
-                            st.markdown(f"##### ***{selected_card}*** performs {description} in decks containing ***{synergy_number}*** ***{synergy_card}***.")
-                            #st.metric("Card", selected_card)
-
+                    # Display synergy card
+                    synergy_url = get_card_image_url(synergy_card)
+                    st.image(synergy_url, width='stretch')
                     
-                    with image_col:
-                        
-                        # Display synergy card
-                        synergy_url = get_card_image_url(synergy_card)
-                        st.image(synergy_url, width='stretch')
-                        
-                        # Display selected card (if any)
-                        if selected_card:
-                            card_url = get_card_image_url(selected_card)
-                            st.image(card_url, width='stretch')
-                            
-                            # Show card stats for selected card
-                            card_data = plotdf.loc[selected_card]
-                            improvement = card_data['Improvement'] * 100
-                            
+                    # Display selected card (if any)
                     if selected_card:
-                        col2, col3, col4, col5 = st.columns(4)
-                        with col2:
-                            st.metric("Baseline WR", f"{card_data['GIH_wr']:.1%}")
-                        with col3:
-                            st.metric("Synergy WR", f"{card_data['GIH_wr_syn']:.1%}")
-                        with col4:
-                            st.metric("Improvement", f"{improvement:+.1f}%")
-                        with col5:
-                            st.metric("Sample Size", f"{card_data['n_GIH_syn']:.0f}")
+                        card_url = get_card_image_url(selected_card)
+                        st.image(card_url, width='stretch')
+                        
+                        # Show card stats for selected card
+                        card_data = plotdf.loc[selected_card]
+                        improvement = card_data['Improvement'] * 100
+                        
+                if selected_card:
+                    col2, col3, col4, col5 = st.columns(4)
+                    with col2:
+                        st.metric("Baseline WR", f"{card_data['GIH_wr']:.1%}")
+                    with col3:
+                        st.metric("Synergy WR", f"{card_data['GIH_wr_syn']:.1%}")
+                    with col4:
+                        st.metric("Improvement", f"{improvement:+.1f}%")
+                    with col5:
+                        st.metric("Sample Size", f"{card_data['n_GIH_syn']:.0f}")
+            
+            with tab2:
+                # Display data table
+                display_df = plotdf.copy()
+                display_df = display_df[['GIH_wr', 'GIH_wr_syn', 'Improvement', 'n_GIH_syn']]
+                display_df.columns = ['Baseline WR', 'Synergy WR', 'Improvement', 'Sample Size']
+                display_df = display_df.sort_values(by='Improvement', ascending=False)
                 
-                with tab2:
-                    # Display data table
-                    display_df = plotdf.copy()
-                    display_df = display_df[['GIH_wr', 'GIH_wr_syn', 'Improvement', 'n_GIH_syn']]
-                    display_df.columns = ['Baseline WR', 'Synergy WR', 'Improvement', 'Sample Size']
-                    display_df = display_df.sort_values(by='Improvement', ascending=False)
-                    
-                    st.dataframe(display_df, width='stretch')
-                            
-            else:
-                st.warning("No synergies found with current parameters. Try adjusting the settings.")
+                st.dataframe(display_df, width='stretch')
         
     except Exception as e:
         st.error(f"Error processing data: {str(e)}")
