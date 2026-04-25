@@ -145,6 +145,7 @@ def get_card_image_url(card_name):
     card_name_safe = card_name.replace("'", "").replace(" ", "+").replace("-", "+").replace(",", "")
     return f"https://api.scryfall.com/cards/named?exact={card_name_safe}&format=image&version=normal"
 
+@st.cache_data(show_spinner=False)
 def get_chunk_counts(chunk, cards, synergy_card, synergy_number):
     """Calculates raw counts (won/played) for a single chunk."""
     # Subset for Synergy
@@ -267,8 +268,7 @@ def analyze_large_csv(selected_set, max_games, synergy_card, synergy_number, min
         download_and_save_raw(url, csv_filename)
     
     cols_to_use = get_needed_columns(csv_filename)
-    cards = [c.replace('opening_hand_', '') for c in cols_to_use if c.startswith('opening_hand_')]
-    cards = [c for c in cards if c != synergy_card]
+    cards = [c for c in non_rare_cards if c != synergy_card]
     
     # Initialize running totals
     total_gih_count = np.zeros(len(cards))
