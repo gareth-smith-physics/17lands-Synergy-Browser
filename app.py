@@ -5,10 +5,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import gzip
-import io
 import time
 import scrython
 import os
+import pyarrow.parquet as pq
 
 
 st.set_page_config(
@@ -105,27 +105,26 @@ min_sample_size = st.sidebar.slider(
     help="Minimum games needed for a card be shown in the results"
 )
 
-# Function to get CSV row count for slider max value
+# Function to get parquet row count for slider max value
 @st.cache_data(show_spinner=False)
-def get_csv_row_count(selected_set):
-    """Get the total number of rows in the CSV file"""
+def get_parquet_row_count(selected_set):
+    """Get the total number of rows in the parquet file"""
     
-    csv_filename = f"game_data_public.{selected_set}.PremierDraft.csv"
+    parquet_filename = f"game_data_public.{selected_set}.PremierDraft.parquet"
     
     # Check if local file exists
-    if os.path.exists(csv_filename):
+    if os.path.exists(parquet_filename):
         try:
-            # Quick way to get row count without loading full data
-            with open(csv_filename, 'r') as f:
-                row_count = sum(1 for _ in f) - 1  # Subtract header row
-            return row_count
+            # Quick way to get row count using pyarrow
+            parquet_file = pq.ParquetFile(parquet_filename)
+            return parquet_file.metadata.num_rows
         except:
             pass
     return 1000000  # Fallback to large default
 
 # Get row count if set is provided
 if selected_set and len(selected_set) == 3:
-    total_rows = get_csv_row_count(selected_set)
+    total_rows = get_parquet_row_count(selected_set)
     max_games = st.sidebar.slider(
         "Maximum Games to Analyze",
         min_value=1000,
@@ -241,33 +240,46 @@ def create_plotly_plot(plotdf, synergy_card, synergy_number):
     
     return fig
 
-def get_needed_columns(csv_filename):
-    """Peek at the header to determine which columns to keep."""
-    needed_prefixes = ('deck_', 'opening_hand_', 'drawn_', 'won', 'rank', 'colors')
-    header = pd.read_csv(csv_filename, nrows=0)
-    return [c for c in header.columns if c.startswith(needed_prefixes)]
-
-def download_and_save_raw(url, csv_filename):
-    """Streams the download and decompresses directly to disk."""
-    with st.spinner("Downloading and decompressing to disk..."):
+def download_and_convert_to_parquet(url, csv_filename, parquet_filename):
+    """Downloads CSV and converts to Parquet immediately to save space and time."""
+    with st.spinner("Downloading data from 17lands..."):
         response = requests.get(url, stream=True, timeout=60)
         response.raise_for_status()
         
-        # Decompress on the fly and write to local file
+        # 1. Stream decompress to a temporary CSV
         with gzip.GzipFile(fileobj=response.raw) as gz:
             with open(csv_filename, 'wb') as f:
-                for chunk in iter(lambda: gz.read(1024 * 1024), b''): # 1MB chunks
+                for chunk in iter(lambda: gz.read(1024 * 1024), b''):
                     f.write(chunk)
 
-@st.cache_data(show_spinner=False)
-def analyze_large_csv(selected_set, max_games, synergy_card, synergy_number):
-    csv_filename = f"game_data_public.{selected_set}.PremierDraft.csv"
+        # 1.5. Filter columns to keep only needed ones
+        needed_prefixes = ('deck_', 'opening_hand_', 'drawn_', 'won')
+        full_header = pd.read_csv(csv_filename, nrows=0).columns
+        cols_to_keep = [c for c in full_header if c.startswith(needed_prefixes)]
+        
+        # 2. Convert CSV to Parquet in chunks to keep RAM low during conversion
+        with pd.read_csv(csv_filename, chunksize=10000, usecols=cols_to_keep) as reader:
+            for i, chunk in enumerate(reader):
+                # On the first chunk, create the file; after that, append
+                append = i > 0
+                chunk.to_parquet(parquet_filename, engine='fastparquet', append=append)
 
-    if not os.path.exists(csv_filename):
+        # 3. Clean up the heavy CSV
+        if os.path.exists(csv_filename):
+            os.remove(csv_filename)
+
+@st.cache_data(show_spinner=False)
+def analyze_large_parquet(selected_set, max_games, synergy_card, synergy_number):
+    parquet_filename = f"game_data_public.{selected_set}.PremierDraft.parquet"
+
+    if not os.path.exists(parquet_filename):
+        csv_filename = f"game_data_public.{selected_set}.PremierDraft.csv"
         url = f"https://17lands-public.s3.amazonaws.com/analysis_data/game_data/{csv_filename}.gz"
-        download_and_save_raw(url, csv_filename)
+        download_and_convert_to_parquet(url, csv_filename, parquet_filename)
     
-    cols_to_use = get_needed_columns(csv_filename)
+    parquet_file = pq.ParquetFile(parquet_filename)
+    needed_prefixes = ('deck_', 'opening_hand_', 'drawn_', 'won')
+    cols_to_use = [c for c in parquet_file.schema.names if c.startswith(needed_prefixes)]
     cards = [c for c in non_rare_cards if c != synergy_card]
     
     # Initialize running totals
@@ -276,32 +288,29 @@ def analyze_large_csv(selected_set, max_games, synergy_card, synergy_number):
     total_syn_count = np.zeros(len(cards))
     total_syn_wins = np.zeros(len(cards))
 
-    dtype_dict = {col: 'int8' for col in cols_to_use if 'won' in col or 'deck_' in col}
-    for col in cols_to_use:
-        if 'opening_hand' in col or 'drawn' in col:
-            dtype_dict[col] = 'int8'
-
     rows_processed = 0
-    with pd.read_csv(csv_filename, usecols=cols_to_use, chunksize=10000, dtype=dtype_dict) as reader:
-        for chunk in reader:
-            # Respect max_games limit
-            if rows_processed >= max_games:
-                break
+    for i in range(parquet_file.num_row_groups):
+        # Respect max_games limit
+        if rows_processed >= max_games:
+            break
+
+        # Load only specific columns for this row group
+        chunk = parquet_file.read_row_group(i, columns=cols_to_use).to_pandas()
+        
+        # If chunk is larger than remaining limit, trim it
+        if rows_processed + len(chunk) > max_games:
+            chunk = chunk.head(max_games - rows_processed)
             
-            # If chunk is larger than remaining limit, trim it
-            if rows_processed + len(chunk) > max_games:
-                chunk = chunk.head(max_games - rows_processed)
-            
-            # Get counts for this chunk
-            gih_c, gih_w, syn_c, syn_w = get_chunk_counts(chunk, cards, synergy_card, synergy_number)
-            
-            # Accumulate
-            total_gih_count += gih_c
-            total_gih_wins += gih_w
-            total_syn_count += syn_c
-            total_syn_wins += syn_w
-            
-            rows_processed += len(chunk)
+        # Get counts for this chunk
+        gih_c, gih_w, syn_c, syn_w = get_chunk_counts(chunk, cards, synergy_card, synergy_number)
+        
+        # Accumulate
+        total_gih_count += gih_c
+        total_gih_wins += gih_w
+        total_syn_count += syn_c
+        total_syn_wins += syn_w
+        
+        rows_processed += len(chunk)
 
     # Final Win Rate Calculations (Vectorized)
     gih_wr = np.divide(total_gih_wins, total_gih_count, out=np.zeros_like(total_gih_wins), where=total_gih_count!=0)
@@ -322,7 +331,7 @@ if selected_set and len(selected_set) == 3 and valid_set_code:
     try:            
         # Analyze synergies
         with st.spinner("Analyzing synergies..."):
-            plotdf = analyze_large_csv(selected_set, max_games, synergy_card, synergy_number)
+            plotdf = analyze_large_parquet(selected_set, max_games, synergy_card, synergy_number)
         
         if len(plotdf) > 0:
 

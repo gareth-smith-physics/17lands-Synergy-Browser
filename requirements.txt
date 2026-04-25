@@ -4,3 +4,5 @@ numpy
 plotly
 scrython
 requests
+pyarrow
+fastparquet
